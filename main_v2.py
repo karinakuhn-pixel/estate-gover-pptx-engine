@@ -10,46 +10,17 @@ import unicodedata
 
 
 app = FastAPI(
-    title="Estate Gover Presentation Generator",
+    title="Estate Gover Presentation Generator V2",
     version="2.0.0"
 )
 
 BASE_DIR = Path(__file__).resolve().parent
 TEMPLATES_DIR = BASE_DIR / "templates"
 OUTPUTS_DIR = BASE_DIR / "outputs"
-OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
-
-
-# ============================================================
-# MODELOS DE DADOS
-# ============================================================
-
-class PresentationRequest(BaseModel):
-    """
-    V1 — mantida para rollback seguro e compatibilidade com a Action atual.
-    """
-    codigo_ativo: str
-    nome_ativo: str
-    localizacao: str
-    tipo_ativo: Optional[str] = None
-    area_aproximada: Optional[str] = None
-    valor_referencia: Optional[str] = None
-    texto_base_capa: str
-    texto_base_estrategica: str
-    observacoes_urbanisticas: Optional[str] = None
-    preservar_multimidia: bool = True
-    formato_saida: str = "pptx"
+OUTPUTS_DIR.mkdir(exist_ok=True)
 
 
 class MediaItem(BaseModel):
-    """
-    Item de mídia V2.
-
-    Regra:
-    - usar somente mídia validada do ativo atual;
-    - nunca aproveitar mídia de outro ativo;
-    - mídia só é aplicada em shapes marcados como EG_SLOT_* ou EG_ASSET_*.
-    """
     slot: str
     tipo: Optional[str] = None
     path: Optional[str] = None
@@ -58,9 +29,6 @@ class MediaItem(BaseModel):
 
 
 class PresentationRequestV2(BaseModel):
-    """
-    V2 — substitui placeholders e aplica política de mídia asset_only.
-    """
     codigo_ativo: str
     nome_ativo: str
     localizacao: str
@@ -84,7 +52,7 @@ class PresentationRequestV2(BaseModel):
     texto_base_capa: Optional[str] = None
     texto_base_estrategica: Optional[str] = None
 
-    # Campos V2
+    # V2
     midias: List[MediaItem] = Field(default_factory=list)
     media_policy: str = "asset_only"
     preservar_multimidia: bool = True
@@ -126,10 +94,6 @@ ASSET_SLOT_PREFIXES = (
 )
 
 
-# ============================================================
-# FUNÇÕES AUXILIARES
-# ============================================================
-
 def normalize_filename(value: str) -> str:
     normalized = unicodedata.normalize("NFD", value)
     without_accents = normalized.encode("ascii", "ignore").decode("utf-8")
@@ -138,10 +102,10 @@ def normalize_filename(value: str) -> str:
 
 def find_template(kind: str) -> Path:
     """
-    Localiza os PPTX oficiais dentro da pasta templates.
+    Localiza o modelo oficial na pasta templates.
 
-    Aceita nomes oficiais e também os nomes atuais do repositório, inclusive
-    variações com "governador" e com/sem acento em "estratégica".
+    A V2 aceita nomes oficiais e também os nomes atuais do repositório,
+    sem quebrar a V1.
     """
     if kind == "capa":
         candidates = [
@@ -187,17 +151,8 @@ def safe_value(value: Any, fallback: str = "[pendente de confirmação]") -> str
     return text
 
 
-def payload_to_dict(payload: BaseModel) -> Dict[str, Any]:
-    """
-    Compatível com Pydantic v1 e v2.
-    """
-    if hasattr(payload, "model_dump"):
-        return payload.model_dump()
-    return payload.dict()
-
-
 def build_placeholder_mapping(payload: PresentationRequestV2) -> Dict[str, str]:
-    data = payload_to_dict(payload)
+    data = payload.dict()
     mapping = {}
 
     for field in PLACEHOLDER_FIELDS:
@@ -208,10 +163,10 @@ def build_placeholder_mapping(payload: PresentationRequestV2) -> Dict[str, str]:
 
 def replace_placeholders_in_presentation(prs: Presentation, mapping: Dict[str, str]) -> int:
     """
-    Substitui placeholders dentro de caixas de texto existentes.
+    Substitui placeholders em caixas de texto existentes.
 
-    Não cria slides, não altera master, não muda layout, não remove QR,
-    WhatsApp, hyperlinks, logos, rodapés ou objetos interativos.
+    Não altera layout, master, posição, tamanho, logos, rodapés, QR codes,
+    botões ou objetos interativos.
     """
     replacements = 0
 
@@ -282,7 +237,7 @@ def apply_media_policy(
     - EG_SLOT_* ou EG_ASSET_* representa mídia do ativo.
     - Se houver mídia válida para o slot, ela entra no espaço existente.
     - Se não houver mídia válida, a mídia do ativo anterior é neutralizada.
-    - Shapes sem marcação técnica não são removidos automaticamente para evitar
+    - Shapes sem marcação técnica não são removidos automaticamente, para evitar
       quebrar QR, WhatsApp, hyperlinks ou multimídia fixa.
     """
     stats = {
@@ -327,9 +282,6 @@ def apply_media_policy(
                     )
                     if clear_text_shape(shape, "[mídia do ativo não fornecida]"):
                         stats["asset_slots_neutralized"] += 1
-                    else:
-                        remove_shape(shape)
-                        stats["asset_slots_neutralized"] += 1
                     continue
 
                 left = shape.left
@@ -357,28 +309,7 @@ def apply_media_policy(
     return stats
 
 
-def gerar_texto_base_v1(payload: PresentationRequest) -> str:
-    return f"""ESTATE GOVER - TEXTO BASE
-
-Código: {payload.codigo_ativo}
-Ativo: {payload.nome_ativo}
-Localização: {payload.localizacao}
-Tipo: {payload.tipo_ativo or ""}
-Área aproximada: {payload.area_aproximada or ""}
-Valor de referência: {payload.valor_referencia or ""}
-
-=== CAPA ===
-{payload.texto_base_capa}
-
-=== ESTRATÉGICA ===
-{payload.texto_base_estrategica}
-
-=== OBSERVAÇÕES URBANÍSTICAS ===
-{payload.observacoes_urbanisticas or ""}
-"""
-
-
-def gerar_texto_base_v2(payload: PresentationRequestV2) -> str:
+def gerar_texto_base(payload: PresentationRequestV2) -> str:
     return f"""ESTATE GOVER — TEXTO BASE V2
 
 Código: {payload.codigo_ativo}
@@ -422,15 +353,12 @@ Observações urbanísticas:
 """
 
 
-def process_pptx_v2(
+def process_pptx(
     template_path: Path,
     output_path: Path,
     payload: PresentationRequestV2,
     warnings: List[str]
 ) -> Dict[str, Any]:
-    """
-    Duplicar matriz oficial, substituir placeholders e aplicar política de mídia V2.
-    """
     shutil.copyfile(template_path, output_path)
 
     prs = Presentation(str(output_path))
@@ -455,78 +383,27 @@ def process_pptx_v2(
     }
 
 
-# ============================================================
-# ROTAS
-# ============================================================
-
 @app.get("/")
 def healthcheck():
     return {
         "status": "ok",
         "service": "Estate Gover Presentation Generator",
-        "version": "2.0.0",
-        "routes": [
-            "/gerar-apresentacao-estate-gover",
-            "/v1/gerar-apresentacao-estate-gover",
-            "/v2/gerar-apresentacao-estate-gover",
-        ],
+        "version": "2.0.0"
     }
 
 
 @app.get("/outputs/{filename}")
 def baixar_arquivo(filename: str):
     file_path = OUTPUTS_DIR / filename
+
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="Arquivo não encontrado.")
+
     return FileResponse(file_path)
-
-
-@app.post("/gerar-apresentacao-estate-gover")
-@app.post("/v1/gerar-apresentacao-estate-gover")
-def gerar_apresentacao_estate_gover(payload: PresentationRequest):
-    """
-    V1 preservada:
-    - duplica os modelos oficiais;
-    - gera texto-base;
-    - não substitui placeholders dentro do PPTX.
-    """
-    if payload.formato_saida != "pptx":
-        raise HTTPException(status_code=400, detail="Apenas formato pptx é permitido.")
-
-    capa_template = find_template("capa")
-    estrategica_template = find_template("estrategica")
-
-    job_id = f"{payload.codigo_ativo}_{uuid.uuid4().hex[:8]}"
-    capa_out = OUTPUTS_DIR / f"{job_id}_CAPA.pptx"
-    estrategica_out = OUTPUTS_DIR / f"{job_id}_ESTRATEGICA.pptx"
-
-    # Versão inicial segura: duplica os modelos oficiais.
-    shutil.copyfile(capa_template, capa_out)
-    shutil.copyfile(estrategica_template, estrategica_out)
-
-    txt_out = OUTPUTS_DIR / f"{job_id}_texto_base.txt"
-    txt_out.write_text(gerar_texto_base_v1(payload), encoding="utf-8")
-
-    return JSONResponse({
-        "status": "ok",
-        "versao": "v1",
-        "mensagem": "Arquivos gerados a partir dos modelos oficiais.",
-        "capa_pptx_url": f"/outputs/{capa_out.name}",
-        "estrategica_pptx_url": f"/outputs/{estrategica_out.name}",
-        "texto_base_url": f"/outputs/{txt_out.name}"
-    })
 
 
 @app.post("/v2/gerar-apresentacao-estate-gover")
 def gerar_apresentacao_estate_gover_v2(payload: PresentationRequestV2):
-    """
-    V2 experimental:
-    - CAPA antes da ESTRATÉGICA;
-    - duplica os modelos oficiais;
-    - substitui placeholders existentes;
-    - preserva elementos fixos;
-    - não reaproveita mídia de outro ativo quando o shape estiver marcado como EG_SLOT_* ou EG_ASSET_*.
-    """
     if payload.formato_saida != "pptx":
         raise HTTPException(
             status_code=400,
@@ -545,10 +422,10 @@ def gerar_apresentacao_estate_gover_v2(payload: PresentationRequestV2):
     txt_out = OUTPUTS_DIR / f"{job_id}_texto_base_v2.txt"
 
     # Ordem obrigatória: CAPA antes da ESTRATÉGICA
-    capa_result = process_pptx_v2(capa_template, capa_out, payload, warnings)
-    estrategica_result = process_pptx_v2(estrategica_template, estrategica_out, payload, warnings)
+    capa_result = process_pptx(capa_template, capa_out, payload, warnings)
+    estrategica_result = process_pptx(estrategica_template, estrategica_out, payload, warnings)
 
-    txt_out.write_text(gerar_texto_base_v2(payload), encoding="utf-8")
+    txt_out.write_text(gerar_texto_base(payload), encoding="utf-8")
 
     return JSONResponse({
         "status": "ok",
