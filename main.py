@@ -7,11 +7,13 @@ from pptx import Presentation
 import shutil
 import uuid
 import unicodedata
+import re
+import zipfile
 
 
 app = FastAPI(
     title="Estate Gover Presentation Generator",
-    version="2.0.0"
+    version="2.1.0"
 )
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -26,8 +28,10 @@ OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
 
 class PresentationRequest(BaseModel):
     """
-    V1 — mantida para rollback seguro e compatibilidade com a Action atual.
+    V1 — mantida apenas para rollback seguro em /v1.
+    Não deve ser usada como rota principal.
     """
+
     codigo_ativo: str
     nome_ativo: str
     localizacao: str
@@ -50,6 +54,7 @@ class MediaItem(BaseModel):
     - nunca aproveitar mídia de outro ativo;
     - mídia só é aplicada em shapes marcados como EG_SLOT_* ou EG_ASSET_*.
     """
+
     slot: str
     tipo: Optional[str] = None
     path: Optional[str] = None
@@ -61,10 +66,10 @@ class PresentationRequestV2(BaseModel):
     """
     V2 — substitui placeholders e aplica política de mídia asset_only.
     """
+
     codigo_ativo: str
     nome_ativo: str
     localizacao: str
-
     tipo_ativo: Optional[str] = None
     area_aproximada: Optional[str] = None
     valor_referencia: Optional[str] = None
@@ -80,11 +85,11 @@ class PresentationRequestV2(BaseModel):
     condicoes_negocio: Optional[str] = None
     observacoes_urbanisticas: Optional[str] = None
 
-    # Campos legados da V1, mantidos por compatibilidade
+    # Campos legados da V1, mantidos por compatibilidade com a Action.
     texto_base_capa: Optional[str] = None
     texto_base_estrategica: Optional[str] = None
 
-    # Campos V2
+    # Campos V2.
     midias: List[MediaItem] = Field(default_factory=list)
     media_policy: str = "asset_only"
     preservar_multimidia: bool = True
@@ -125,38 +130,54 @@ ASSET_SLOT_PREFIXES = (
     "EG_ASSET_",
 )
 
+WHATSAPP_URL_RE = re.compile(
+    r"https?://(?:api\.whatsapp\.com/send\?phone=|wa\.me/)[^\s<>\"]+",
+    flags=re.IGNORECASE,
+)
+
+WHATSAPP_LABEL = "Abrir WhatsApp"
+
+IMAGE_CTA_PATTERNS = (
+    "aperte na imagem",
+    "clique na imagem",
+    "descubra o que te espera",
+)
+
 
 # ============================================================
 # FUNÇÕES AUXILIARES
 # ============================================================
 
-def normalize_filename(value: str) -> str:
-    normalized = unicodedata.normalize("NFD", value)
+def normalize_text(value: str) -> str:
+    normalized = unicodedata.normalize("NFD", value or "")
     without_accents = normalized.encode("ascii", "ignore").decode("utf-8")
-    return without_accents.lower()
+    return without_accents.lower().strip()
+
+
+def normalize_filename(value: str) -> str:
+    return normalize_text(value).replace(" ", "-")
 
 
 def find_template(kind: str) -> Path:
     """
     Localiza os PPTX oficiais dentro da pasta templates.
 
-    Aceita nomes oficiais e também os nomes atuais do repositório, inclusive
-    variações com "governador" e com/sem acento em "estratégica".
+    Regra V2:
+    - usar somente nomes Estate Gover;
+    - não aceitar mais "estate-governador" como fallback silencioso.
     """
+
     if kind == "capa":
         candidates = [
             "estate-gover-capa-modelo-final.pptx",
-            "estate-governador-capa-modelo-final.pptx",
         ]
-        keywords = ["capa"]
+        keywords = ["estate-gover", "capa"]
     elif kind == "estrategica":
         candidates = [
             "estate-gover-estrategica-modelo-final.pptx",
             "estate-gover-estratégica-modelo-final.pptx",
-            "estate-governador-estrategica-modelo-final.pptx",
-            "estate-governador-estratégica-modelo-final.pptx",
         ]
-        keywords = ["estrategica", "estrateg"]
+        keywords = ["estate-gover", "estrateg"]
     else:
         raise ValueError("Tipo de modelo inválido.")
 
@@ -167,12 +188,14 @@ def find_template(kind: str) -> Path:
 
     for path in TEMPLATES_DIR.glob("*.pptx"):
         normalized = normalize_filename(path.name)
+        if "governador" in normalized:
+            continue
         if all(keyword in normalized for keyword in keywords):
             return path
 
     raise HTTPException(
         status_code=500,
-        detail=f"Modelo oficial {kind} não encontrado na pasta templates."
+        detail=f"Modelo oficial {kind} não encontrado na pasta templates com nomenclatura Estate Gover."
     )
 
 
@@ -191,6 +214,7 @@ def payload_to_dict(payload: BaseModel) -> Dict[str, Any]:
     """
     Compatível com Pydantic v1 e v2.
     """
+
     if hasattr(payload, "model_dump"):
         return payload.model_dump()
     return payload.dict()
@@ -213,6 +237,7 @@ def replace_placeholders_in_presentation(prs: Presentation, mapping: Dict[str, s
     Não cria slides, não altera master, não muda layout, não remove QR,
     WhatsApp, hyperlinks, logos, rodapés ou objetos interativos.
     """
+
     replacements = 0
 
     for slide in prs.slides:
@@ -285,6 +310,7 @@ def apply_media_policy(
     - Shapes sem marcação técnica não são removidos automaticamente para evitar
       quebrar QR, WhatsApp, hyperlinks ou multimídia fixa.
     """
+
     stats = {
         "fixed_preserved": 0,
         "asset_slots_found": 0,
@@ -325,11 +351,13 @@ def apply_media_policy(
                     warnings.append(
                         f"Mídia do slot {slot} não encontrada no caminho informado: {media.path}"
                     )
+
                     if clear_text_shape(shape, "[mídia do ativo não fornecida]"):
                         stats["asset_slots_neutralized"] += 1
                     else:
                         remove_shape(shape)
                         stats["asset_slots_neutralized"] += 1
+
                     continue
 
                 left = shape.left
@@ -355,6 +383,128 @@ def apply_media_policy(
         )
 
     return stats
+
+
+def sanitize_visible_whatsapp_links(prs: Presentation) -> int:
+    """
+    Substitui URLs visíveis de WhatsApp por texto comercial limpo,
+    preservando o hyperlink no próprio run quando possível.
+    """
+
+    replacements = 0
+
+    for slide in prs.slides:
+        for shape in slide.shapes:
+            if not hasattr(shape, "text_frame") or shape.text_frame is None:
+                continue
+
+            for paragraph in shape.text_frame.paragraphs:
+                if not paragraph.runs:
+                    current_text = getattr(shape, "text", "") or ""
+                    match = WHATSAPP_URL_RE.search(current_text)
+                    if match:
+                        shape.text = WHATSAPP_LABEL
+                        replacements += 1
+                    continue
+
+                for run in paragraph.runs:
+                    text = run.text or ""
+                    match = WHATSAPP_URL_RE.search(text)
+                    if not match:
+                        continue
+
+                    url = match.group(0)
+                    run.text = WHATSAPP_LABEL
+
+                    try:
+                        run.hyperlink.address = url
+                    except Exception:
+                        # Se o run não aceitar hyperlink, mantém ao menos o texto visual limpo.
+                        pass
+
+                    replacements += 1
+
+    return replacements
+
+
+def neutralize_image_ctas_without_media(prs: Presentation, media_stats: Dict[str, int]) -> int:
+    """
+    Remove chamadas como "Aperte na imagem" quando nenhum slot de mídia do ativo foi preenchido.
+    Isso evita prometer interação visual quando a imagem foi neutralizada por falta de mídia válida.
+    """
+
+    if media_stats.get("asset_slots_replaced", 0) > 0:
+        return 0
+
+    replacements = 0
+
+    for slide in prs.slides:
+        for shape in slide.shapes:
+            if not hasattr(shape, "text_frame") or shape.text_frame is None:
+                continue
+
+            original_text = getattr(shape, "text", "") or ""
+            normalized = normalize_text(original_text)
+
+            if not normalized:
+                continue
+
+            if any(pattern in normalized for pattern in IMAGE_CTA_PATTERNS):
+                clear_text_shape(shape, "")
+                replacements += 1
+
+    return replacements
+
+
+def update_core_metadata(
+    prs: Presentation,
+    payload: PresentationRequestV2,
+    presentation_kind: str
+) -> bool:
+    """
+    Atualiza metadados internos do PPTX para evitar herança de dados do ativo-base
+    do modelo, como "EG0013 Canela".
+    """
+
+    try:
+        props = prs.core_properties
+
+        kind_label = "CAPA" if presentation_kind == "capa" else "ESTRATÉGICA"
+
+        props.title = f"Estate Gover {kind_label} - {payload.codigo_ativo}"
+        props.subject = f"{payload.nome_ativo} | {payload.localizacao}"
+        props.author = "Estate Gover"
+        props.last_modified_by = "Estate Gover PPTX Engine"
+        props.category = "Estate Gover Presentation"
+        props.keywords = f"Estate Gover, {payload.codigo_ativo}, {kind_label}"
+        props.comments = (
+            "Arquivo gerado pelo Estate Gover PPTX Engine a partir dos modelos oficiais. "
+            "CAPA e ESTRATÉGICA devem permanecer separadas."
+        )
+
+        return True
+    except Exception:
+        return False
+
+
+def validate_pptx_package(path: Path, warnings: List[str]) -> bool:
+    """
+    Validação técnica básica do pacote PPTX.
+    Não substitui abertura no PowerPoint, mas ajuda a detectar ZIP corrompido.
+    """
+
+    try:
+        with zipfile.ZipFile(path) as zf:
+            bad_file = zf.testzip()
+
+        if bad_file:
+            warnings.append(f"PPTX com arquivo interno possivelmente corrompido: {bad_file}")
+            return False
+
+        return True
+    except Exception as exc:
+        warnings.append(f"Falha ao validar pacote PPTX {path.name}: {exc}")
+        return False
 
 
 def gerar_texto_base_v1(payload: PresentationRequest) -> str:
@@ -426,20 +576,31 @@ def process_pptx_v2(
     template_path: Path,
     output_path: Path,
     payload: PresentationRequestV2,
-    warnings: List[str]
+    warnings: List[str],
+    presentation_kind: str,
 ) -> Dict[str, Any]:
     """
-    Duplicar matriz oficial, substituir placeholders e aplicar política de mídia V2.
+    Duplicar matriz oficial, substituir placeholders, aplicar política de mídia V2
+    e corrigir metadados/textos auxiliares sem alterar a identidade visual.
     """
+
     shutil.copyfile(template_path, output_path)
 
     prs = Presentation(str(output_path))
-    mapping = build_placeholder_mapping(payload)
 
+    metadata_updated = update_core_metadata(prs, payload, presentation_kind)
+
+    mapping = build_placeholder_mapping(payload)
     replacements = replace_placeholders_in_presentation(prs, mapping)
+
     media_stats = apply_media_policy(prs, payload, warnings)
 
+    whatsapp_links_sanitized = sanitize_visible_whatsapp_links(prs)
+    image_ctas_neutralized = neutralize_image_ctas_without_media(prs, media_stats)
+
     prs.save(str(output_path))
+
+    pptx_package_validated = validate_pptx_package(output_path, warnings)
 
     if replacements == 0:
         warnings.append(
@@ -447,11 +608,20 @@ def process_pptx_v2(
             "Confirme se o PPTX possui placeholders como {{codigo_ativo}}, {{localizacao}} e {{valor_referencia}}."
         )
 
+    if not metadata_updated:
+        warnings.append(
+            f"Metadados internos não puderam ser atualizados em {output_path.name}."
+        )
+
     return {
         "template": template_path.name,
         "output": output_path.name,
         "text_replacements": replacements,
         "media_stats": media_stats,
+        "metadata_updated": metadata_updated,
+        "whatsapp_links_sanitized": whatsapp_links_sanitized,
+        "image_ctas_neutralized": image_ctas_neutralized,
+        "pptx_package_validated": pptx_package_validated,
     }
 
 
@@ -464,32 +634,35 @@ def healthcheck():
     return {
         "status": "ok",
         "service": "Estate Gover Presentation Generator",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "routes": [
             "/gerar-apresentacao-estate-gover",
             "/v1/gerar-apresentacao-estate-gover",
             "/v2/gerar-apresentacao-estate-gover",
         ],
+        "default_route": "/gerar-apresentacao-estate-gover now uses V2",
     }
 
 
 @app.get("/outputs/{filename}")
 def baixar_arquivo(filename: str):
     file_path = OUTPUTS_DIR / filename
+
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="Arquivo não encontrado.")
+
     return FileResponse(file_path)
 
 
-@app.post("/gerar-apresentacao-estate-gover")
 @app.post("/v1/gerar-apresentacao-estate-gover")
-def gerar_apresentacao_estate_gover(payload: PresentationRequest):
+def gerar_apresentacao_estate_gover_v1(payload: PresentationRequest):
     """
-    V1 preservada:
+    V1 preservada para rollback:
     - duplica os modelos oficiais;
     - gera texto-base;
     - não substitui placeholders dentro do PPTX.
     """
+
     if payload.formato_saida != "pptx":
         raise HTTPException(status_code=400, detail="Apenas formato pptx é permitido.")
 
@@ -497,6 +670,7 @@ def gerar_apresentacao_estate_gover(payload: PresentationRequest):
     estrategica_template = find_template("estrategica")
 
     job_id = f"{payload.codigo_ativo}_{uuid.uuid4().hex[:8]}"
+
     capa_out = OUTPUTS_DIR / f"{job_id}_CAPA.pptx"
     estrategica_out = OUTPUTS_DIR / f"{job_id}_ESTRATEGICA.pptx"
 
@@ -517,16 +691,21 @@ def gerar_apresentacao_estate_gover(payload: PresentationRequest):
     })
 
 
+@app.post("/gerar-apresentacao-estate-gover")
 @app.post("/v2/gerar-apresentacao-estate-gover")
 def gerar_apresentacao_estate_gover_v2(payload: PresentationRequestV2):
     """
-    V2 experimental:
+    V2 — rota principal:
     - CAPA antes da ESTRATÉGICA;
     - duplica os modelos oficiais;
     - substitui placeholders existentes;
     - preserva elementos fixos;
+    - limpa metadados herdados do modelo;
+    - troca links visíveis de WhatsApp por texto comercial;
+    - neutraliza chamadas de imagem quando não há mídia do ativo;
     - não reaproveita mídia de outro ativo quando o shape estiver marcado como EG_SLOT_* ou EG_ASSET_*.
     """
+
     if payload.formato_saida != "pptx":
         raise HTTPException(
             status_code=400,
@@ -544,9 +723,22 @@ def gerar_apresentacao_estate_gover_v2(payload: PresentationRequestV2):
     estrategica_out = OUTPUTS_DIR / f"{job_id}_ESTRATEGICA_V2.pptx"
     txt_out = OUTPUTS_DIR / f"{job_id}_texto_base_v2.txt"
 
-    # Ordem obrigatória: CAPA antes da ESTRATÉGICA
-    capa_result = process_pptx_v2(capa_template, capa_out, payload, warnings)
-    estrategica_result = process_pptx_v2(estrategica_template, estrategica_out, payload, warnings)
+    # Ordem obrigatória: CAPA antes da ESTRATÉGICA.
+    capa_result = process_pptx_v2(
+        capa_template,
+        capa_out,
+        payload,
+        warnings,
+        presentation_kind="capa",
+    )
+
+    estrategica_result = process_pptx_v2(
+        estrategica_template,
+        estrategica_out,
+        payload,
+        warnings,
+        presentation_kind="estrategica",
+    )
 
     txt_out.write_text(gerar_texto_base_v2(payload), encoding="utf-8")
 
