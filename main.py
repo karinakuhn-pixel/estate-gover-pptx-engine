@@ -9,11 +9,12 @@ import uuid
 import unicodedata
 import re
 import zipfile
+import xml.etree.ElementTree as ET
 
 
 app = FastAPI(
     title="Estate Gover Presentation Generator",
-    version="2.1.0"
+    version="2.2.0"
 )
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -300,15 +301,17 @@ def apply_media_policy(
     warnings: List[str]
 ) -> Dict[str, int]:
     """
-    Política de mídia V2.
+    Política de mídia V2.2 — modo seguro para integridade do PowerPoint.
 
-    Regra:
+    Regras:
     - EG_FIXED_* deve ser preservado.
     - EG_SLOT_* ou EG_ASSET_* representa mídia do ativo.
-    - Se houver mídia válida para o slot, ela entra no espaço existente.
-    - Se não houver mídia válida, a mídia do ativo anterior é neutralizada.
-    - Shapes sem marcação técnica não são removidos automaticamente para evitar
-      quebrar QR, WhatsApp, hyperlinks ou multimídia fixa.
+    - Não remover shapes do PPTX. Remoção direta pode deixar relações internas órfãs
+      e fazer o PowerPoint pedir reparo.
+    - Se houver mídia válida, ela é aplicada por cima do espaço existente.
+    - Se não houver mídia válida, neutraliza texto do slot quando for caixa de texto.
+      Para slot visual sem texto, desloca o shape antigo para fora da área visível e
+      insere uma caixa de texto informativa no mesmo espaço, sem deletar relações internas.
     """
 
     stats = {
@@ -317,6 +320,7 @@ def apply_media_policy(
         "asset_slots_replaced": 0,
         "asset_slots_neutralized": 0,
         "untagged_media_untouched": 0,
+        "non_destructive_mode": 1,
     }
 
     midias_por_slot = {}
@@ -329,6 +333,32 @@ def apply_media_policy(
             continue
 
         midias_por_slot[item.slot] = item
+
+    def neutralize_visual_slot(slide, shape, message: str = "[mídia do ativo não fornecida]") -> bool:
+        """
+        Neutraliza slot sem remover shape:
+        - se for caixa de texto, troca pelo aviso;
+        - se for imagem/vídeo/forma sem texto, move para fora do slide e cria aviso no espaço original.
+        """
+        if clear_text_shape(shape, message):
+            return True
+
+        try:
+            left = shape.left
+            top = shape.top
+            width = shape.width
+            height = shape.height
+
+            # Move o conteúdo antigo para fora da área visível sem quebrar suas relações internas.
+            shape.left = prs.slide_width + 914400
+            shape.top = prs.slide_height + 914400
+
+            textbox = slide.shapes.add_textbox(left, top, width, height)
+            textbox.text = message
+            return True
+        except Exception:
+            # Último fallback: não remove nada para evitar corromper o pacote.
+            return False
 
     for slide in prs.slides:
         for shape in list(slide.shapes):
@@ -352,10 +382,7 @@ def apply_media_policy(
                         f"Mídia do slot {slot} não encontrada no caminho informado: {media.path}"
                     )
 
-                    if clear_text_shape(shape, "[mídia do ativo não fornecida]"):
-                        stats["asset_slots_neutralized"] += 1
-                    else:
-                        remove_shape(shape)
+                    if neutralize_visual_slot(slide, shape):
                         stats["asset_slots_neutralized"] += 1
 
                     continue
@@ -365,15 +392,12 @@ def apply_media_policy(
                 width = shape.width
                 height = shape.height
 
-                remove_shape(shape)
+                # Não remove o shape original; aplica a mídia validada por cima.
                 slide.shapes.add_picture(str(media_path), left, top, width=width, height=height)
                 stats["asset_slots_replaced"] += 1
             else:
-                # Neutralização segura para não vazar mídia de outro ativo.
-                if clear_text_shape(shape, "[mídia do ativo não fornecida]"):
-                    stats["asset_slots_neutralized"] += 1
-                else:
-                    remove_shape(shape)
+                # Neutralização não destrutiva para não vazar mídia de outro ativo.
+                if neutralize_visual_slot(slide, shape):
                     stats["asset_slots_neutralized"] += 1
 
     if stats["asset_slots_found"] == 0:
@@ -388,7 +412,11 @@ def apply_media_policy(
 def sanitize_visible_whatsapp_links(prs: Presentation) -> int:
     """
     Substitui URLs visíveis de WhatsApp por texto comercial limpo,
-    preservando o hyperlink no próprio run quando possível.
+    preservando o hyperlink sempre que possível.
+
+    V2.2:
+    - trata URLs quebradas em múltiplos runs;
+    - evita deixar a URL crua visível nos slides de contato.
     """
 
     replacements = 0
@@ -399,27 +427,42 @@ def sanitize_visible_whatsapp_links(prs: Presentation) -> int:
                 continue
 
             for paragraph in shape.text_frame.paragraphs:
-                if not paragraph.runs:
-                    current_text = getattr(shape, "text", "") or ""
-                    match = WHATSAPP_URL_RE.search(current_text)
-                    if match:
-                        shape.text = WHATSAPP_LABEL
-                        replacements += 1
-                    continue
+                runs = list(paragraph.runs)
 
-                for run in paragraph.runs:
-                    text = run.text or ""
-                    match = WHATSAPP_URL_RE.search(text)
+                if runs:
+                    paragraph_text = "".join((run.text or "") for run in runs)
+                    match = WHATSAPP_URL_RE.search(paragraph_text)
+
                     if not match:
                         continue
 
                     url = match.group(0)
-                    run.text = WHATSAPP_LABEL
+
+                    # Mantém somente um texto visual limpo no primeiro run.
+                    runs[0].text = WHATSAPP_LABEL
+                    for run in runs[1:]:
+                        run.text = ""
 
                     try:
-                        run.hyperlink.address = url
+                        runs[0].hyperlink.address = url
                     except Exception:
-                        # Se o run não aceitar hyperlink, mantém ao menos o texto visual limpo.
+                        pass
+
+                    replacements += 1
+                    continue
+
+                current_text = getattr(shape, "text", "") or ""
+                match = WHATSAPP_URL_RE.search(current_text)
+
+                if match:
+                    url = match.group(0)
+                    shape.text = WHATSAPP_LABEL
+
+                    try:
+                        first_paragraph = shape.text_frame.paragraphs[0]
+                        first_run = first_paragraph.runs[0]
+                        first_run.hyperlink.address = url
+                    except Exception:
                         pass
 
                     replacements += 1
@@ -485,6 +528,71 @@ def update_core_metadata(
         return True
     except Exception:
         return False
+
+
+def prune_unused_slide_relationships(path: Path, warnings: List[str]) -> int:
+    """
+    Remove relações órfãs de slides depois das alterações.
+    Isso reduz risco de o PowerPoint pedir reparo quando algum hyperlink/mídia antigo
+    deixa de ser referenciado pelo XML do slide.
+    """
+
+    pruned = 0
+
+    try:
+        tmp_path = path.with_suffix(".tmp.pptx")
+
+        rel_ns = "http://schemas.openxmlformats.org/package/2006/relationships"
+        r_ns = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+        ET.register_namespace("", rel_ns)
+
+        with zipfile.ZipFile(path, "r") as zin, zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zout:
+            names = zin.namelist()
+
+            for name in names:
+                data = zin.read(name)
+
+                if name.startswith("ppt/slides/_rels/slide") and name.endswith(".xml.rels"):
+                    slide_name = name.replace("ppt/slides/_rels/", "ppt/slides/").replace(".rels", "")
+
+                    if slide_name in names:
+                        slide_root = ET.fromstring(zin.read(slide_name))
+                        used_ids = set()
+
+                        for elem in slide_root.iter():
+                            for attr_name, attr_value in elem.attrib.items():
+                                if attr_name.startswith("{" + r_ns + "}") and attr_value:
+                                    used_ids.add(attr_value)
+
+                        rel_root = ET.fromstring(data)
+                        removed_any = False
+
+                        for rel in list(rel_root):
+                            rid = rel.attrib.get("Id")
+                            rel_type = rel.attrib.get("Type", "")
+
+                            is_prunable = (
+                                rel_type.endswith("/image")
+                                or rel_type.endswith("/video")
+                                or rel_type.endswith("/media")
+                                or rel_type.endswith("/hyperlink")
+                            )
+
+                            if is_prunable and rid and rid not in used_ids:
+                                rel_root.remove(rel)
+                                pruned += 1
+                                removed_any = True
+
+                        if removed_any:
+                            data = ET.tostring(rel_root, encoding="utf-8", xml_declaration=True)
+
+                zout.writestr(name, data)
+
+        tmp_path.replace(path)
+        return pruned
+    except Exception as exc:
+        warnings.append(f"Falha ao limpar relações órfãs do PPTX {path.name}: {exc}")
+        return pruned
 
 
 def validate_pptx_package(path: Path, warnings: List[str]) -> bool:
@@ -600,6 +708,7 @@ def process_pptx_v2(
 
     prs.save(str(output_path))
 
+    unused_relationships_pruned = prune_unused_slide_relationships(output_path, warnings)
     pptx_package_validated = validate_pptx_package(output_path, warnings)
 
     if replacements == 0:
@@ -621,6 +730,7 @@ def process_pptx_v2(
         "metadata_updated": metadata_updated,
         "whatsapp_links_sanitized": whatsapp_links_sanitized,
         "image_ctas_neutralized": image_ctas_neutralized,
+        "unused_relationships_pruned": unused_relationships_pruned,
         "pptx_package_validated": pptx_package_validated,
     }
 
@@ -634,7 +744,7 @@ def healthcheck():
     return {
         "status": "ok",
         "service": "Estate Gover Presentation Generator",
-        "version": "2.1.0",
+        "version": "2.2.0",
         "routes": [
             "/gerar-apresentacao-estate-gover",
             "/v1/gerar-apresentacao-estate-gover",
@@ -703,7 +813,7 @@ def gerar_apresentacao_estate_gover_v2(payload: PresentationRequestV2):
     - limpa metadados herdados do modelo;
     - troca links visíveis de WhatsApp por texto comercial;
     - neutraliza chamadas de imagem quando não há mídia do ativo;
-    - não reaproveita mídia de outro ativo quando o shape estiver marcado como EG_SLOT_* ou EG_ASSET_*.
+    - não remove shapes do PPTX; neutraliza mídia com política não destrutiva.
     """
 
     if payload.formato_saida != "pptx":
