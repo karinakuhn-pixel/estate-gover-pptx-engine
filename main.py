@@ -14,7 +14,7 @@ import xml.etree.ElementTree as ET
 
 app = FastAPI(
     title="Estate Gover Presentation Generator",
-    version="2.3.0"
+    version="2.4.0"
 )
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -301,7 +301,7 @@ def apply_media_policy(
     warnings: List[str]
 ) -> Dict[str, int]:
     """
-    Política de mídia V2.3 — modo seguro para integridade do PowerPoint.
+    Política de mídia V2.4 — modo seguro para integridade do PowerPoint.
 
     Regras:
     - EG_FIXED_* deve ser preservado.
@@ -311,9 +311,8 @@ def apply_media_policy(
     - Slide 01 é protegido como capa padrão: sem mídia nova válida, o slot visual original
       do modelo permanece intacto, sem ser movido e sem receber aviso de mídia ausente.
     - Se houver mídia válida, ela é aplicada por cima do espaço existente.
-    - Nos demais slides, se não houver mídia válida, neutraliza texto do slot quando for caixa de texto.
-      Para slot visual sem texto, desloca o shape antigo para fora da área visível e
-      insere uma caixa de texto informativa no mesmo espaço, sem deletar relações internas.
+    - Se não houver mídia válida, nenhum slide recebe o texto "[mídia do ativo não fornecida]".
+      O slot original do modelo é preservado para manter o padrão visual da matriz aprovada.
     """
 
     stats = {
@@ -323,6 +322,7 @@ def apply_media_policy(
         "asset_slots_neutralized": 0,
         "untagged_media_untouched": 0,
         "cover_slots_preserved_as_template": 0,
+        "asset_slots_preserved_as_template": 0,
         "non_destructive_mode": 1,
     }
 
@@ -385,10 +385,11 @@ def apply_media_policy(
                         f"Mídia do slot {slot} não encontrada no caminho informado: {media.path}"
                     )
 
+                    # V2.4: não inserir mensagem visual nem mover shapes.
+                    # Preserva o slot original da matriz para manter o padrão visual.
+                    stats["asset_slots_preserved_as_template"] += 1
                     if slide_index == 1:
                         stats["cover_slots_preserved_as_template"] += 1
-                    elif neutralize_visual_slot(slide, shape):
-                        stats["asset_slots_neutralized"] += 1
 
                     continue
 
@@ -401,15 +402,12 @@ def apply_media_policy(
                 slide.shapes.add_picture(str(media_path), left, top, width=width, height=height)
                 stats["asset_slots_replaced"] += 1
             else:
-                # Slide 01 deve permanecer como capa padrão quando não há mídia do ativo.
-                # Não move o fundo/slot visual e não cria caixa "[mídia do ativo não fornecida]".
+                # V2.4: sem mídia do ativo, preservar o slot original da matriz aprovada.
+                # Não move shapes, não remove objetos e não escreve "[mídia do ativo não fornecida]".
+                stats["asset_slots_preserved_as_template"] += 1
                 if slide_index == 1:
                     stats["cover_slots_preserved_as_template"] += 1
-                    continue
-
-                # Neutralização não destrutiva para não vazar mídia de outro ativo nos demais slides.
-                if neutralize_visual_slot(slide, shape):
-                    stats["asset_slots_neutralized"] += 1
+                continue
 
     if stats["asset_slots_found"] == 0:
         warnings.append(
@@ -865,7 +863,7 @@ def gerar_apresentacao_estate_gover_v2(payload: PresentationRequestV2):
 
     return JSONResponse({
         "status": "ok",
-        "versao": "v2.3",
+        "versao": "v2.4",
         "mensagem": "Arquivos V2 gerados a partir dos modelos oficiais.",
         "codigo_ativo": payload.codigo_ativo,
         "media_policy": payload.media_policy,
