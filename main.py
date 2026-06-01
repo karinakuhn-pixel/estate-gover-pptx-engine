@@ -14,7 +14,7 @@ import xml.etree.ElementTree as ET
 
 app = FastAPI(
     title="Estate Gover Presentation Generator",
-    version="2.4.0"
+    version="2.5.0"
 )
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -539,6 +539,65 @@ def update_core_metadata(
         return False
 
 
+
+
+def sanitize_hidden_template_references(
+    path: Path,
+    payload: PresentationRequestV2,
+    presentation_kind: str,
+    warnings: List[str],
+) -> int:
+    """
+    Remove referências técnicas ocultas herdadas do modelo/base, como caminhos
+    internos ou descrições com EG0013/Canela/Governador, sem alterar layout,
+    mídia, relações, QR, WhatsApp ou conteúdo visível dos slides.
+    """
+
+    sanitized = 0
+
+    try:
+        tmp_path = path.with_suffix(".hidden-clean.tmp.pptx")
+        kind_label = "CAPA" if presentation_kind == "capa" else "ESTRATÉGICA"
+        replacement_value = (
+            f"Estate Gover {kind_label} — slot preservado do modelo oficial "
+            f"para {payload.codigo_ativo}"
+        )
+
+        # Só limpa atributos descritivos/metadados de elementos visuais.
+        # Não altera rId, Target, relationship, embed ou hyperlinks.
+        attr_pattern = re.compile(
+            r'\b(?P<attr>descr|title)="[^"]*(?:eg0013|canela|governador|/mnt/data/)[^"]*"',
+            flags=re.IGNORECASE,
+        )
+
+        with zipfile.ZipFile(path, "r") as zin, zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zout:
+            for name in zin.namelist():
+                data = zin.read(name)
+
+                if name.endswith(".xml"):
+                    try:
+                        xml_text = data.decode("utf-8")
+                    except UnicodeDecodeError:
+                        zout.writestr(name, data)
+                        continue
+
+                    def repl(match):
+                        nonlocal sanitized
+                        sanitized += 1
+                        return f'{match.group("attr")}="{replacement_value}"'
+
+                    xml_text = attr_pattern.sub(repl, xml_text)
+                    data = xml_text.encode("utf-8")
+
+                zout.writestr(name, data)
+
+        tmp_path.replace(path)
+        return sanitized
+
+    except Exception as exc:
+        warnings.append(f"Falha ao limpar referências ocultas herdadas em {path.name}: {exc}")
+        return sanitized
+
 def prune_unused_slide_relationships(path: Path, warnings: List[str]) -> int:
     """
     Remove relações órfãs de slides depois das alterações.
@@ -718,6 +777,12 @@ def process_pptx_v2(
     prs.save(str(output_path))
 
     unused_relationships_pruned = prune_unused_slide_relationships(output_path, warnings)
+    hidden_template_refs_sanitized = sanitize_hidden_template_references(
+        output_path,
+        payload,
+        presentation_kind,
+        warnings,
+    )
     pptx_package_validated = validate_pptx_package(output_path, warnings)
 
     if replacements == 0:
@@ -740,6 +805,7 @@ def process_pptx_v2(
         "whatsapp_links_sanitized": whatsapp_links_sanitized,
         "image_ctas_neutralized": image_ctas_neutralized,
         "unused_relationships_pruned": unused_relationships_pruned,
+        "hidden_template_refs_sanitized": hidden_template_refs_sanitized,
         "pptx_package_validated": pptx_package_validated,
     }
 
@@ -863,7 +929,7 @@ def gerar_apresentacao_estate_gover_v2(payload: PresentationRequestV2):
 
     return JSONResponse({
         "status": "ok",
-        "versao": "v2.4",
+        "versao": "v2.5",
         "mensagem": "Arquivos V2 gerados a partir dos modelos oficiais.",
         "codigo_ativo": payload.codigo_ativo,
         "media_policy": payload.media_policy,
