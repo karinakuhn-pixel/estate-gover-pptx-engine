@@ -12,6 +12,11 @@ import zipfile
 import xml.etree.ElementTree as ET
 import os
 
+from v27.bootstrap import build_v27_runtime_safely
+from v27.middleware import V27OperationIdMiddleware
+from v27.routes import build_v27_router
+from v27.security import resolve_safe_output_path
+
 
 app = FastAPI(
     title="Estate Gover Presentation Generator",
@@ -32,6 +37,21 @@ PUBLIC_BASE_URL = os.getenv(
 
 # Governança fixa do backend.
 PUBLICACAO_AUTOMATICA = False
+
+# Runtime isolado V2.7. Drive permanece desabilitado por padrão e qualquer
+# falha de configuração recua com segurança sem indisponibilizar V1/V2.6.
+V27_RUNTIME = build_v27_runtime_safely()
+V27_AUDIT_LOGGER = V27_RUNTIME.audit_logger
+app.add_middleware(
+    V27OperationIdMiddleware,
+    audit_logger=V27_AUDIT_LOGGER,
+)
+app.include_router(build_v27_router(
+    V27_AUDIT_LOGGER,
+    V27_RUNTIME.drive_provider,
+    V27_RUNTIME.renderer,
+    V27_RUNTIME.serial_guard,
+))
 
 
 # ============================================================
@@ -1304,6 +1324,7 @@ def healthcheck():
             "/gerar-apresentacao-estate-gover",
             "/v1/gerar-apresentacao-estate-gover",
             "/v2/gerar-apresentacao-estate-gover",
+            "/v2.7/gerar-apresentacao-estate-gover",
         ],
         "default_route": (
             "/gerar-apresentacao-estate-gover "
@@ -1317,6 +1338,16 @@ def healthcheck():
             "sobrescrita_silenciosa": False,
             "url_absoluta": True,
         },
+        "v2_7": {
+            "estado": (
+                "FASE_2_HOMOLOG_CONFIGURADA"
+                if V27_RUNTIME.drive_provider is not None
+                else "FASE_1_IMPLEMENTADA"
+            ),
+            "geracao_disponivel": V27_RUNTIME.renderer is not None,
+            "drive_disponivel": V27_RUNTIME.drive_provider is not None,
+            "publicacao_automatica": False,
+        },
     }
 
 
@@ -1327,7 +1358,10 @@ def healthcheck():
 def baixar_arquivo(
     filename: str
 ):
-    file_path = OUTPUTS_DIR / filename
+    file_path = resolve_safe_output_path(
+        OUTPUTS_DIR,
+        filename,
+    )
 
     if not file_path.exists():
         raise HTTPException(
